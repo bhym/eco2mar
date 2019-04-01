@@ -1,0 +1,242 @@
+---
+title: "Ecology and Economy in the sea: strengths and gaps in trans-dominion communication"
+subtitle: "R notebook accompanying the paper"
+output:
+  html_document:
+    theme: sandstone
+    highlight: tango
+    code_folding: hide
+    fig_width: 10
+---
+
+```{r include=FALSE}
+  library("tidyverse")
+  library("kableExtra")
+  library("textmineR")
+  library("igraph")
+  library("alluvial")
+  library("ggdendro")
+  library("tidygraph")
+  library("ggraph")
+  library("gridExtra")
+  library("dendextend")
+  Sys.setlocale("LC_ALL", "C")
+```
+
+### Loading and tidying the data
+The original file is based on an [isi/wos](https://www.webofknowledge.org/) search on the query "marine AND ecology AND economy" (~1000 hits).
+After removing all the entries without abstract (~300 hits), we screened the abstracts for inconsistencies, removing ~200 articles. ~600 articles remain.
+```{r loadata}
+  dataset <- read.csv(file = "./inputs/dataset per analisi.csv",
+                      header = T, sep = ";", stringsAsFactors = F)
+```
+
+We select title and abstract from the file, use the ISI identifier for the id column, and join title and abstract into a single row. Later we discover that many abstracts end with copyright notices, so we remove those.
+```{r tidydat}
+  dataset.clean <- dataset %>%
+    select(UT,TI,AB) %>%
+    as_tibble %>%
+    unite(TI_and_ABS,TI,AB, sep = " ") %>%
+    rename(intText=TI_and_ABS,id=UT) %>%
+    mutate(intText= gsub("\\([Cc]) [0-9]... .*","",intText))
+```
+
+# Using textmineR
+We choose the [textimineR](https://cran.r-project.org/web/packages/textmineR) package for topic modelling because its topic naming and testing capabilities.
+
+We create the document term matrix (rows are documents, columns are single words) and keep all the words found more than five times in the corpus (i.e. the document collection).
+```{r dtmcr, message=FALSE, results='hide'}
+  dtm <- CreateDtm(doc_vec = dataset.clean$intText, # character vector of documents
+                   doc_names = dataset.clean$id, # document names
+                   ngram_window = c(1, 2), # minimum and maximum n-gram length
+                   stopword_vec = c(stopwords::stopwords("en"), # stopwords from tm
+                                    stopwords::stopwords(source = "smart")), # this is the default value
+                   lower = TRUE, # lowercase - this is the default value
+                   remove_punctuation = TRUE, # punctuation - this is the default
+                   remove_numbers = TRUE, # numbers - this is the default
+                   verbose = TRUE)
+
+  dtm <- dtm[, colSums(dtm > 0) > 5] #Here we select words appearing more than five times
+```
+
+## Basic corpus statistic
+Now that we have the document/term matrix, we can calculate term frequency (_how often each term appears in the dtm_), document frequency (_in how many documents the term appears_), and inverse document frequency, for both terms and bigrams.
+```{r basicor, echo=FALSE, message=FALSE}
+  tf_mat <- TermDocFreq(dtm = dtm)
+  tf_bigrams <- tf_mat[stringr::str_detect(tf_mat$term, "_"), ]
+
+  tfh  <- head(tf_bigrams[order(tf_bigrams$term_freq, decreasing = TRUE), ], 10)
+  tfbh <- head(tf_mat[order(tf_mat$term_freq, decreasing = TRUE), ], 10)
+  kable(tfh, escape =F, align="c") %>%
+   kable_styling(bootstrap_options = c("striped", "hover"), full_width=F, position = "float_left", font_size=12)
+  kable(tfbh, escape =F, align="c") %>%
+   kable_styling(bootstrap_options = c("striped", "hover"), full_width=F, position = "right", font_size=12)
+```
+
+## Fitting the model
+```{r minerparms, invisible=T}
+  miner_K <- 15
+  miner_itrs <- 500
+  miner_burn <- 180
+  miner_alpha <- 0.1
+  miner_beta_<- colSums(dtm) / sum(dtm) * 100
+```
+
+We can now fit the model. We choose `r miner_K` topics, again with a relatively diffuse prior for topics over documents ($alpha =$ `r miner_alpha`)[^1]  and an asymmetric prior for word over topics.
+
+[^1]: a high alpha value means that each document is likely to cotain a mixture of most of the topics and not any single topic specifically. a low alpha value means that is it more likely that a document may contain mixture of just a few, or even only one, of the topics.
+
+```{r minermodfit, eval=F}
+  model <- FitLdaModel(dtm = dtm,
+                       k = miner_K,
+                       iterations = miner_itrs,
+                       burnin = miner_burn,
+                       alpha = miner_alpha,
+                       beta  = miner_beta_,
+                       optimize_alpha = TRUE,
+                       calc_likelihood = FALSE,
+                       calc_coherence = TRUE,
+                       calc_r2 = FALSE)
+```
+
+<center>
+### The model is not calculated within this notebook, see here. ###
+</center>
+
+```{r minermodload}
+  load("./inputs/good_model.Rdata")
+  model <- good_mod
+  rm(good_mod)
+```
+
+The output from the model is an S3 object of class lda\_topic\_model.
+It contains several objects:
+
+* The most important are three matrices:
+  * theta gives $P(\text{topic}_{k}\mid\text{document}_{d})$;
+  * phi gives   $P(\text{word}_{v}\mid\text{topic}_{k})$;
+  * gamma gives $P(\text{topic}_{k}\mid\text{word}_{v})$;
+
+* data is the DTM or TCM used to train the model;
+* alpha and beta are the Dirichlet priors for topics over documents and words over topics, respectively;
+* log\_likelihood is $P(\text{words}\mid\text{topics})$ at each iteration;
+* coherence gives the probabilistic coherence of each topic;
+* r2 is the R-squared of the model given the data.
+
+Let's explore the topic's properties
+```{r topexp}
+  model$top_terms <- GetTopTerms(phi = model$phi, M = 5)
+  model$prevalence <- colSums(model$theta) / sum(model$theta) * 100
+  model$labels <- LabelTopics(assignments = model$theta > 0.05,
+                              dtm = dtm,
+                              M = 1)
+  model$summary <- data.frame(topic = rownames(model$phi),
+                              label = model$labels,
+                              coherence = round(model$coherence, 3),
+                              prevalence = round(model$prevalence,3),
+                              top_terms = apply(model$top_terms, 2, function(x){
+                                paste(x, collapse = ", ")
+                              }),
+                              stringsAsFactors = FALSE)
+
+  model$summary %>% mutate(coherence=  cell_spec(coherence, color = "white",
+                           bold = T,
+                           background = spec_color(order(coherence), end=0.9, option="B", direction=-1)
+                           )) %>%
+  kable(escape =F, align="c") %>%
+   kable_styling(bootstrap_options = c("striped", "hover"), full_width=F, position = "center")
+```
+
+* The coherence terms measures how associated words are in a topic, controlling for statistical independance.
+* The prevalence measures the frequency of each topic in the entire corpus
+
+## Topics and papers interactions
+Now that we have probability distribution for words in each topic, we can calculate similarity among topics using the [Hellinger distance](https://en.wikipedia.org/wiki/Hellinger_Distance).
+The distance has been used as the base for [ward.D](https://en.wikipedia.org/wiki/Ward%27s_method) agglomerative hiearchical clustering (dendrogram on the left).
+Expert knowledge has been used to decide to cut the tree in three groups: these re the three ``fields'' on which we will discuss our results.
+
+```{r tophelldist}
+  top.dist.mat <- CalcHellingerDist(model$phi) %>% as.dist
+  nam <- model$summary$label_1
+  names(top.dist.mat) <- paste(rownames(model$summary), " - ", nam, ifelse(duplicated(nam),"_bis","") , sep="")
+```
+
+```{r tophelltree}
+  top.dendri <- hclust(top.dist.mat, "ward.D")
+  top.clustering <- cutree(top.dendri, 3)
+  a<- top.dendri %>% as.dendrogram %>% 
+       set("branches_k_color", value = c( "#FF6600FF","#440154FF", "#21908CFF"), k = 3) %>%
+       set("labels_cex", value=0.75) %>%
+       hang.dendrogram %>%
+       as.ggdend %>%
+       ggplot
+```
+
+```{r paphelldist}
+  pap.dist.mat <- CalcHellingerDist(model$theta) %>% as.dist
+  pap.dr <- pap.dist.mat %>%
+   stats::cmdscale(., k=2) %>%
+   as_tibble() %>%
+   rename(x=V1,y=V2)
+```
+
+```{r paphellmds}
+  innet2 <- apply(model$theta, 1, function(x) {
+                 names(x)[order(x, decreasing = TRUE)][1]
+       })
+  innet3 <- top.clustering[innet2]
+  b <- ggplot(pap.dr %>% mutate(topw=innet3)) +
+    aes(x=x, y=y, col=factor(topw)) +
+    geom_point(size=2.5, alpha=0.75) +
+  scale_color_manual(name="field",values = c("#440154FF", "#21908CFF", "#FF6600FF")) +
+  theme_void() +
+  scale_x_reverse()
+```
+
+```{r gridplot, warning=FALSE}
+grid.arrange(a,b, ncol=2)
+```
+We use Hellinger distance also for calculating the distance between document pairs, based on the probability distribution for each topic in each paper.
+Now We can performed a metric dimensional scaling on the papers' distance matrix, and display its first two dimensions as scatter plot (plot on the right).
+
+## Alluvial plot
+Finally, we display the connection between words and fields through topics using an alluvial diagram.
+```{r papnet2, warning=F, message=F}
+  blippo <- table(innet2) %>%
+    enframe(name = "topic") %>%
+    rename(count = "value") %>%
+    left_join(top.clustering %>%
+              enframe(name = "topic")) %>%
+    rename(Fields= "value") %>%
+    mutate(count = as.vector(count),
+           name = c("IS", "ET", "EP", "ES", "MPA", "FI",
+                    "SD", "MP", "BGC", "MR", "HAB", "CR",
+                    "AQ", "CC", "FS"),
+           Fields = factor(Fields,
+                          labels = c("Conservation", "Management", "Impacts"))
+           )
+  blippo$exp_lab <- c("Invasive Species","Eco-tourism","Eco-physiology","Ecosystem Services","Marine Protected Areas","Fisheries","Sustainable Development","Marine Policy","Bigeochemical Cycles","Marine Resources","Harmul Algal Blooms","Coral Reefs","Aquaculture","Climate Change","Fish species")
+  blupi <- blippo %>%
+    left_join(model$summary) %>%
+    select(-coherence,-prevalence) %>%
+    separate_rows(top_terms, sep=",") %>%
+    select(Fields,topic,exp_lab,top_terms, count) %>%
+    mutate(top_terms=trimws(top_terms)) %>%
+    mutate(topic=as.integer(gsub("t_","",topic))) %>%
+    arrange(topic) %>%
+    unite(topic,topic,exp_lab,sep=" - ") %>%
+    mutate(topic=factor(topic, levels=unique(topic)))
+  
+  icol <- blupi$Fields %>% as.factor %>% as.integer
+  tavol <- c(Impacts="#440154FF", Management="#21908CFF", Conservation="#FF6600FF")
+  alluvial(blupi[,-4], freq=blupi$count, alpha=0.5, col=tavol[icol], cex=0.5, border = NA, blocks=FALSE)
+```
+
+<center>
+## The next notebook will analyse Scopus data
+</center>
+
+```{r}
+```
+
+

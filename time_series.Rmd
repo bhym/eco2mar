@@ -1,0 +1,188 @@
+---
+title: "Ecology and Economy in the sea: strengths and gaps in trans-dominion communication"
+subtitle: "R notebook accompanying the paper"
+authors:
+  - name: Bruno Hay Mele 
+    address: Stazione Zoologica Anton Dohrn, Department of Integrative Marine Ecology, Naples (Italy)
+    email: bruno.haymele(at)szn.it
+  - name: Luca Russo
+    address: Stazione Zoologica Anton Dohrn, Department of Integrative Marine Ecology, Naples (Italy)
+    email: luca.russo93@hotmail.com
+  - name: Domenico D'Alelio
+    address:  Stazione Zoologica Anton Dohrn, Department of Integrative Marine Ecology, Naples (Italy)
+    email: dalelio@szn.it
+output:
+  html_document:
+    theme: sandstone
+    highlight: tango
+    code_folding: hide
+    fig_width: 10
+---
+
+```{r include=FALSE}
+library("tidyverse")
+library("tidytext")
+library("textmineR")
+library("kableExtra")
+library("lubridate")
+library("gridExtra")
+```
+# Before this
+We downloaded from scopus all the results from the query "marine AND ecology AND economy" in every part of the document (22061 documents). Our idea is to use titles, abstracts and keyword to infer the topics associated to the article collection (we will call it "corpus"), and to look how topics are connected and how they varies in time.
+To download the abstracts, we use the Scopus API. We first removed the entries without DOIs (2663 documents), and then used the DOIs of the remaining ones (19398 documents) to query Scopus for full records. Since the download takes hours, we saved the results in a file. __Such file represents our current input.__
+
+Now we have to find where titles, abstracts, and keywords are
+
+```{r loexp}
+  load("./inputs/batch_scopus.Rdata")
+  retr[[1]]$content$`full-text-retrieval-response`$`coredata` %>% names %>% sort
+```
+
+It seems that we want _dc:title_(title) _dcterms:subject_(keywords) and _dc:description_ (abstract)
+Let's retreive those, and wrap them up into a nice dataframe
+```{r titandelse, cache=T}
+  tit.extraction <- lapply(retr, function(x){
+               z <- x$content$`full-text-retrieval-response`$coredata$`prism:coverDate`
+               o <- x$content$`full-text-retrieval-response`$coredata$`dc:identifier`
+               a <- x$content$`full-text-retrieval-response`$coredata$`dc:title`
+  #This needs to be cleaned because we have the word "Abstract" and some "\r" appearing every time
+               b <- x$content$`full-text-retrieval-response`$coredata$`dc:description` %>%
+                 gsub("\n ", "",.) %>%
+                 gsub(" +", " ",.)
+
+  #This needs adjustments because it is originally a list with n keywords and n "Trues"
+               d <- x$content$`full-text-retrieval-response`$coredata$`dcterms:subject` %>%
+                 unlist %>%
+                 as_tibble %>%
+                 filter(value !="true") %>%
+                 unlist %>%
+                 paste(collapse = ",") %>%
+                 gsub("\n ", "",.) %>%
+                 gsub("Abstract", "",.) %>%
+                 gsub(" +", " ",.)
+
+               z <- ifelse( is.null(z), " ",z )
+               o <- ifelse( is.null(o), " ",o )
+               a <- ifelse( is.null(a), " ",a )
+               b <- ifelse( is.null(b), " ",b )
+               d <- ifelse(is.null(d)," ",d)
+               data.frame(date=z,doi=o,title=a,keywords=d,abstract=b, stringsAsFactors=F)
+               })
+  bigdat <- do.call(rbind.data.frame, tit.extraction)
+```
+
+We select title and abstract from the file, use the DOI for the id column, and join title and abstract into a single row. Later we discover that many abstracts ends with copyright notices, so we remove those.
+How many missing information we have per column?
+
+```{r missing}
+  noabs        <- apply(bigdat,2,function(x) sum(is.na(x)))
+  nokey        <- apply(bigdat,2,function(x) sum(x=="", na.rm=T))
+  nodoi_or_tit <- apply(bigdat,2,function(x) sum(x==" ", na.rm=T))
+  no <- noabs + nokey + nodoi_or_tit
+  rbind(number=no, percent=round(no/nrow(bigdat),2)*100) %>% knitr::kable() %>%
+   kable_styling(bootstrap_options = c("striped", "hover"), full_width=T)
+```
+Quite a few! This is because of scopus downloading informations only for papers indexed by sciencedirect. We remove all the entries without abstract (72%), because there is not enough information to classify such entries with our LDA model.
+
+```{r bigfil}
+  bigdat <- bigdat %>% filter(!is.na(abstract))
+```
+
+<center>
+## We will be working with `r nrow(bigdat)` papers.
+</center>
+
+```{r tidydat}
+  dataset.clean <- bigdat %>%
+  as_tibble %>%
+  unite(TI_and_ABS,title,keywords,abstract, sep = " ") %>%
+  rename(intText=TI_and_ABS,id=doi) %>%
+  mutate(intText= gsub("\\([Cc]) [0-9]... .*","",intText))
+```
+
+We create the document term matrix (rows are documents, columns are single words) and keep all the words found more than five times in the corpus (i.e. the document collection).
+```{r dtmcr, message=FALSE, results='hide'}
+  dtm <- CreateDtm(doc_vec = dataset.clean$intText, # character vector of documents
+                   doc_names = dataset.clean$id, # document names
+                   ngram_window = c(1, 2), # minimum and maximum n-gram length
+                   stopword_vec = c(stopwords::stopwords("en"), # stopwords from tm
+                                    stopwords::stopwords(source = "smart")), # this is the default value
+                   lower = TRUE, # lowercase - this is the default value
+                   remove_punctuation = TRUE, # punctuation - this is the default
+                   remove_numbers = TRUE, # numbers - this is the default
+                   verbose = TRUE)
+  dtm <- dtm[, colSums(dtm > 0) > 5]
+
+  dtm <- dtm[ , !stringr::str_detect(colnames(dtm),"(abstract)|(Abstract)|(na)|(NA)") ]
+```
+## Basic corpus statistic
+Now that we have the document/term matrix, we can calculate term frequency (_how often each term appears in the dtm_), document frequency (_in how many documents the term appears_), and inverse document frequency, for both terms and bigrams.
+
+```{r basicor, echo=FALSE, message=FALSE}
+  tf_mat <- TermDocFreq(dtm = dtm)
+  tf_bigrams <- tf_mat[stringr::str_detect(tf_mat$term, "_"), ]
+  tfh  <- head(tf_bigrams[order(tf_bigrams$term_freq, decreasing = TRUE), ], 10)
+  tfbh <- head(tf_mat[order(tf_mat$term_freq, decreasing = TRUE), ], 10)
+
+  kable(tfh, escape =F, align="c") %>%
+   kable_styling(bootstrap_options = c("striped", "hover"), full_width=F, position = "float_left", font_size=11)
+
+  kable(tfbh, escape =F, align="c") %>%
+   kable_styling(bootstrap_options = c("striped", "hover"), full_width=F, position = "right", font_size=11)
+```
+Now, let's predict papers' topics based on our ISI model
+
+```{r predict, cache=T}
+  #First, load the model
+  load("./inputs/good_model.Rdata")
+  model <- good_mod
+  rm(good_mod)
+       p1 <- predict(model, dtm, method = "gibbs", iterations = 200, burnin = 175)
+```
+
+And plot the results as a barplot.
+```{r barplots, message=F}
+  load("./inputs/topic_clustering.Rdata")
+  clus <- clustering %>%
+   as_tibble %>%
+   rownames_to_column %>%
+   rename(maxtop=rowname, cluster=value) %>%
+   mutate(maxtop = gsub("_([0-9])$","_0\\1",maxtop))
+
+  beb <- p1 %>%
+   as_tibble() %>%
+   rownames_to_column("id") %>% mutate(date=ymd(bigdat$date),id=as.integer(id)) %>%
+   gather(topic,probability,-id,-date) %>%
+   #mutate(topic = gsub("_([0-9])$","_0\\1",topic)) %>%
+   group_by(id) %>%
+   mutate(maxtop = topic[which.max(probability)], maxprob=max(probability)) %>%
+   select(-topic,-probability) %>%
+   distinct %>%
+   arrange(id) %>%
+   group_by(year=floor_date(date, "year"),maxtop) %>%
+   filter(year(year) < 2019) %>%
+   summarise(times=n(),average_maxprob=mean(maxprob), sd_maxprob=max(0,sd(maxprob),na.rm=T))
+
+  bub <- beb %>%
+   left_join(clus %>%
+   mutate(maxtop=paste("t_",maxtop, sep ="")))
+
+a <-  ggplot(bub) +
+  aes(x=year,y=times,fill=factor(cluster)) +
+  geom_col() +
+  scale_fill_manual(name="field",values = c("#440154FF", "#21908CFF", "#FF6600FF")) +
+  theme_minimal() +
+  labs(y = "count")
+
+b <-  ggplot(bub) +
+  aes(x=year,y=times,fill=factor(maxtop)) +
+  geom_col() +
+  scale_fill_viridis_d(name="Topic")  +
+  theme_minimal() +
+  labs(y = "count")
+
+  grid.arrange(arrangeGrob(a,b))
+  #For saving the plots:
+  #g <- arrangeGrob(c_, arrangeGrob(a,b), ncol=2, widths=c(0.5,1.5))
+  #ggsave(file="../outs/output_plot.pdf",useDingbats=F,g,width=12,heigh=12)
+```
