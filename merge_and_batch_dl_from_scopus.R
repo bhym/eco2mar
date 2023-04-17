@@ -16,4 +16,4 @@ retr <- retr[-c(4031, 18546)]
 # DOI provided is not available in ScienceDirect (it is a Taylor and Francis publication).
 # The Article Retrieval API (/content/article/doi) pulls articles from the ScienceDirect corpus.
 # Only articles available on ScienceDirect are available through that API.
-save("../inputs/batch_scopus.Rdata")
+save(retr, "../inputs/batch_scopus.Rdata")
